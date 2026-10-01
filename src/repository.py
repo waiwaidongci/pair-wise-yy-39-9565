@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ENTITY, ID_PREFIX, STATES
 
 
 class Repository:
@@ -64,6 +64,38 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('seepage','displacement')),
+                    value REAL NOT NULL,
+                    unit TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    external_ref TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, kind, observed_at)
+                );
+                CREATE TABLE IF NOT EXISTS sync_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    actor TEXT NOT NULL,
+                    expected_version INTEGER NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS conclusions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL,
+                    detail TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'current'
+                        CHECK(status IN ('current','superseded')),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, revision)
                 );
             """)
 
@@ -157,24 +189,153 @@ class Repository:
             ).fetchone()
         return int(row["n"])
 
+    def _append_audit_locked(self, action: str, entity_type: str, entity_id: int,
+                             actor: str, detail: dict) -> Dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous = row["entry_hash"] if row else "GENESIS"
+        event = make_entry(action, entity_type, entity_id, actor, detail, previous)
+        cur = self.conn.execute(
+            """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+               previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+             json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+             event["previous_hash"], event["entry_hash"], event["created_at"]),
+        )
+        event["id"] = int(cur.lastrowid)
+        return event
+
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
         with self._lock, self.conn:
-            row = self.conn.execute(
-                "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+            return self._append_audit_locked(action, entity_type, entity_id, actor, detail)
+
+    def _latest_readings_locked(self, item_id: int) -> Dict[str, Any]:
+        rows = self.conn.execute(
+            "SELECT * FROM readings WHERE item_id=? ORDER BY observed_at, id", (item_id,)
+        ).fetchall()
+        latest: Dict[str, Any] = {}
+        for row in rows:
+            latest[row["kind"]] = dict(row)
+        return latest
+
+    def apply_reading_batch(self, item_id: int, batch_id: str, expected_version: int,
+                            readings: List[Dict[str, Any]], actor: str,
+                            conclusion_builder) -> tuple:
+        """单个事务内应用一个补传批次：幂等检查、版本校验、读数入库、
+        版本递增、复核结论失效重算、审计和批次回执一起提交或一起回滚。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            batch = self.conn.execute(
+                "SELECT item_id, result FROM sync_batches WHERE batch_id=?", (batch_id,)
             ).fetchone()
-            previous = row["entry_hash"] if row else "GENESIS"
-            event = make_entry(action, entity_type, entity_id, actor, detail, previous)
-            cur = self.conn.execute(
-                """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
-                   previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (event["action"], event["entity_type"], event["entity_id"], event["actor"],
-                 json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
-                 event["previous_hash"], event["entry_hash"], event["created_at"]),
+            if batch is not None:
+                if int(batch["item_id"]) != item_id:
+                    raise ConflictError("批次号已用于其他缺陷")
+                return json.loads(batch["result"]), True
+            row = self.conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            item = dict(row)
+            if int(item["version"]) != expected_version:
+                raise ConflictError(
+                    f"版本冲突，当前版本为{item['version']}",
+                    details={"current_version": item["version"]})
+            inserted = []
+            try:
+                for reading in readings:
+                    cur = self.conn.execute(
+                        """INSERT INTO readings(item_id, kind, value, unit, observed_at,
+                           batch_id, external_ref, created_by, created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (item_id, reading["kind"], reading["value"], reading["unit"],
+                         reading["observed_at"], batch_id, reading["external_ref"],
+                         actor, now),
+                    )
+                    inserted.append(dict(reading, id=int(cur.lastrowid), item_id=item_id,
+                                         batch_id=batch_id, created_by=actor, created_at=now))
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("读数与已有记录冲突（同一缺陷同类型同观测时间）") from exc
+            new_version = int(item["version"]) + 1
+            self.conn.execute(
+                "UPDATE items SET version=?, updated_at=? WHERE id=?",
+                (new_version, now, item_id),
             )
-            event_id = int(cur.lastrowid)
-        event["id"] = event_id
-        return event
+            latest = self._latest_readings_locked(item_id)
+            previous = self.conn.execute(
+                "SELECT id, revision FROM conclusions WHERE item_id=? AND status='current'",
+                (item_id,),
+            ).fetchone()
+            superseded_revision = None
+            if previous is not None:
+                superseded_revision = int(previous["revision"])
+                self.conn.execute(
+                    "UPDATE conclusions SET status='superseded' WHERE id=?",
+                    (previous["id"],),
+                )
+            revision = int(self.conn.execute(
+                "SELECT COALESCE(MAX(revision),0)+1 AS rev FROM conclusions WHERE item_id=?",
+                (item_id,),
+            ).fetchone()["rev"])
+            conclusion = conclusion_builder(item, latest)
+            cur = self.conn.execute(
+                """INSERT INTO conclusions(item_id, revision, detail, status, created_by,
+                   created_at) VALUES(?,?,?,?,?,?)""",
+                (item_id, revision,
+                 json.dumps(conclusion, ensure_ascii=False, sort_keys=True),
+                 "current", actor, now),
+            )
+            observed_times = [r["observed_at"] for r in inserted]
+            self._append_audit_locked("reading_sync", ENTITY, item_id, actor, {
+                "batch_id": batch_id, "inserted": len(inserted),
+                "kinds": sorted({r["kind"] for r in inserted}),
+                "observed_from": min(observed_times), "observed_to": max(observed_times),
+                "version": new_version,
+            })
+            self._append_audit_locked("conclusion", ENTITY, item_id, actor, {
+                "revision": revision, "superseded_revision": superseded_revision,
+                "escalation_required": conclusion["escalation_required"],
+                "priority": conclusion["priority"],
+            })
+            result = {
+                "item_id": item_id, "batch_id": batch_id, "version": new_version,
+                "inserted": inserted, "effective": latest,
+                "conclusion": {
+                    "id": int(cur.lastrowid), "revision": revision, "status": "current",
+                    "detail": conclusion, "superseded_revision": superseded_revision,
+                },
+            }
+            self.conn.execute(
+                """INSERT INTO sync_batches(batch_id, item_id, actor, expected_version,
+                   result, created_at) VALUES(?,?,?,?,?,?)""",
+                (batch_id, item_id, actor, expected_version,
+                 json.dumps(result, ensure_ascii=False, sort_keys=True), now),
+            )
+            return result, False
+
+    def list_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? ORDER BY observed_at, id",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_conclusions(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM conclusions WHERE item_id=? ORDER BY revision DESC",
+                (item_id,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            entry = dict(row)
+            entry["detail"] = json.loads(entry["detail"])
+            result.append(entry)
+        return result
 
     def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"

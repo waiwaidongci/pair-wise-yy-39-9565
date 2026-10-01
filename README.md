@@ -30,9 +30,33 @@ python3 app.py --db ./data.db --port 8316
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
-- `GET /api/audit`
+- `POST /api/items/{id}/readings/sync`，离线补传渗流/位移读数（见下）
+- `GET /api/items/{id}/readings`，按观测时间排序的读数时间线
+- `GET /api/items/{id}/conclusions`，复核结论历史（含已失效）
+- `GET /api/audit`，支持`?item_id=`过滤
 
 允许角色：inspector, dam_engineer, emergency_manager, viewer。异常值比控制阈值越高，缺陷优先级越高；应急处置缺陷必须完成复检并记录证据后才能关闭。
+
+## 离线补传
+
+巡检员断网时记录读数，回网后按批次补传：
+
+```json
+POST /api/items/{id}/readings/sync
+{
+  "batch_id": "设备端生成的批次号",
+  "expected_version": 3,
+  "readings": [
+    {"kind": "seepage", "value": 12.5, "observed_at": "2026-09-30T08:00:00Z"},
+    {"kind": "displacement", "value": 3.1, "observed_at": "2026-09-30T08:05:00Z"}
+  ]
+}
+```
+
+- 读数按`observed_at`（现场观测时间）合并：观测时间早于已处置读数的补传照样入库留痕，生效读数取观测时间最新者，不按到达顺序覆盖。
+- 每次成功补传后旧复核结论标记`superseded`并按生效读数重算，历史结论可经`GET /api/items/{id}/conclusions`查询，处置与审计记录全部保留。
+- 同一缺陷并发补传只有一份成立，冲突方收到`409`及`current_version`，按当前版本重试即可。
+- 批次整体事务提交，中途失败不留半条记录；用原`batch_id`重试幂等，已成功的批次重放返回原结果（HTTP 200），首次成功为201。
 
 ## 测试
 

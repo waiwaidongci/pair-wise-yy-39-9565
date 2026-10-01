@@ -71,7 +71,11 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            payload = {"error": exc.__class__.__name__, "message": str(exc)}
+            details = getattr(exc, "details", None)
+            if details:
+                payload.update(details)
+            self._json(status, payload)
 
         def do_GET(self) -> None:
             try:
@@ -89,6 +93,16 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/readings"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"readings": service.list_readings(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/conclusions"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"conclusions": service.list_conclusions(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -97,7 +111,9 @@ def make_handler(service: Service, static_dir: str):
                 elif path == "/api/audit":
                     actor, role = self._identity()
                     del actor
-                    self._json(200, {"events": service.audit(role)})
+                    query = parse_qs(urlparse(self.path).query)
+                    item_id = int(query["item_id"][0]) if "item_id" in query else None
+                    self._json(200, {"events": service.audit(role, item_id)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -113,6 +129,10 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/readings/sync"):
+                    item_id = int(path.split("/")[3])
+                    result, replayed = service.sync_readings(item_id, body, actor, role)
+                    self._json(200 if replayed else 201, result)
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")

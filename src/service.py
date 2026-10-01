@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ValidationError, ensure_role, normalize_reading_kind,
+                     normalize_severity, require_number, require_text,
+                     require_timestamp)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, DEFAULT_READING_UNITS, ENTITY,
+                    RECORD_ROLES, SYNC_ROLES, TITLE, VIEW_ROLES,
+                    completion_blockers, compute_conclusion,
+                    escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -86,6 +90,50 @@ class Service:
     def list_records(self, item_id: int, role: str) -> list:
         self._view(role)
         return self.repository.list_records(item_id)
+
+    @staticmethod
+    def _validate_reading(entry: Any) -> Dict[str, Any]:
+        if not isinstance(entry, dict):
+            raise ValidationError("读数必须是JSON对象")
+        kind = normalize_reading_kind(entry.get("kind"))
+        value = require_number(entry.get("value"), "value")
+        unit = require_text(entry.get("unit") or DEFAULT_READING_UNITS[kind], "unit", 20)
+        observed_at = require_timestamp(entry.get("observed_at"), "observed_at")
+        external_ref = entry.get("external_ref")
+        if external_ref is not None:
+            external_ref = require_text(external_ref, "external_ref", 100)
+        return {"kind": kind, "value": value, "unit": unit,
+                "observed_at": observed_at, "external_ref": external_ref}
+
+    def sync_readings(self, item_id: int, payload: Dict[str, Any], actor: str,
+                      role: str) -> tuple:
+        """离线补传：整批校验后一次性落库；batch_id幂等，版本冲突时返回当前版本。"""
+        ensure_role(role, SYNC_ROLES)
+        actor = require_text(actor, "actor", 100)
+        batch_id = require_text(payload.get("batch_id"), "batch_id", 100)
+        expected = payload.get("expected_version")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
+            raise ValidationError("expected_version必须是正整数")
+        raw = payload.get("readings")
+        if not isinstance(raw, list) or not raw:
+            raise ValidationError("readings必须是非空数组")
+        if len(raw) > 200:
+            raise ValidationError("单批次读数不能超过200条")
+        readings = [self._validate_reading(entry) for entry in raw]
+        result, replayed = self.repository.apply_reading_batch(
+            item_id, batch_id, expected, readings, actor,
+            lambda item, latest: compute_conclusion(
+                item["severity"], item["threshold"], latest))
+        result["replayed"] = replayed
+        return result, replayed
+
+    def list_readings(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_readings(item_id)
+
+    def list_conclusions(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_conclusions(item_id)
 
     def audit(self, role: str, item_id: Optional[int] = None) -> list:
         ensure_role(role, AUDIT_ROLES)
