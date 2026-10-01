@@ -1,9 +1,11 @@
 from __future__ import annotations
+from datetime import datetime
 from .domain import ConflictError, ValidationError
 TITLE='大坝巡检、缺陷与应急管理'; ENTITY='大坝缺陷'; ID_PREFIX='DS'
 SEVERITIES=['observation', 'minor', 'major', 'emergency']; STATES=['planned', 'inspected', 'defect_confirmed', 'repair', 'verified', 'closed']; TRANSITIONS={'planned': ['inspected'], 'inspected': ['defect_confirmed'], 'defect_confirmed': ['repair'], 'repair': ['verified'], 'verified': ['closed'], 'closed': []}; TRANSITION_ROLES={'inspected': ['inspector'], 'defect_confirmed': ['dam_engineer'], 'repair': ['dam_engineer'], 'verified': ['inspector'], 'closed': ['emergency_manager']}
 CREATE_ROLES=set(['inspector']); RECORD_ROLES=set(['inspector', 'dam_engineer']); AUDIT_ROLES=set(['emergency_manager', 'viewer']); VIEW_ROLES=set(['inspector', 'dam_engineer', 'emergency_manager', 'viewer'])
 SEVERITY_WEIGHT={'observation': 1.0, 'minor': 3.0, 'major': 6.0, 'emergency': 9.0}; DEADLINE_HOURS={'observation': 72, 'minor': 24, 'major': 8, 'emergency': 4}; TERMINAL_STATES=set(['closed'])
+READING_KINDS=('seepage','displacement'); REVIEW_CONCLUSIONS=('normal','abnormal')
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
     ratio=quantity/threshold if threshold>0 else 1.0
@@ -20,3 +22,31 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+def _parse_timestamp(value):
+    if not isinstance(value,str): return None
+    try: return datetime.fromisoformat(value.replace('Z','+00:00'))
+    except ValueError: return None
+def recalculate_review(item,readings):
+    """根据缺陷的全部读数重算复核结论。
+
+    取每类读数的最新观测值与缺陷阈值比较：任一最新读数达到阈值即异常，否则正常。
+    返回 (conclusion, detail)，detail 记录触发依据供审计追溯。
+    """
+    latest={}; latest_dt={}
+    for reading in readings:
+        kind=reading.get('kind')
+        if kind not in READING_KINDS: continue
+        observed=reading.get('observed_at')
+        dt=_parse_timestamp(observed)
+        if kind not in latest or (dt is not None and (latest_dt.get(kind) is None or dt>latest_dt[kind])):
+            latest[kind]=reading; latest_dt[kind]=dt
+    threshold=float(item.get('threshold',1) or 0.0)
+    triggered=[]; values={}
+    for kind in READING_KINDS:
+        reading=latest.get(kind)
+        if reading is None: continue
+        value=float(reading.get('value',0) or 0.0)
+        values[kind]=value
+        if threshold>0 and value>=threshold: triggered.append(kind)
+    conclusion='abnormal' if triggered else 'normal'
+    return conclusion,{'triggered':triggered,'latest':values,'threshold':threshold}

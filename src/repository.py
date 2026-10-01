@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ENTITY, ID_PREFIX, STATES, recalculate_review
 
 
 class Repository:
@@ -65,6 +65,34 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS backfill_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    batch_id TEXT NOT NULL REFERENCES backfill_batches(batch_id),
+                    kind TEXT NOT NULL CHECK(kind IN ('seepage','displacement')),
+                    value REAL NOT NULL,
+                    unit TEXT,
+                    observed_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_readings_item ON readings(item_id, id);
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    conclusion TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '{{}}',
+                    stale INTEGER NOT NULL DEFAULT 0,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_reviews_item ON reviews(item_id, id);
             """)
 
     @staticmethod
@@ -157,24 +185,204 @@ class Repository:
             ).fetchone()
         return int(row["n"])
 
+    def _append_audit_tx(self, conn, action: str, entity_type: str, entity_id: int,
+                         actor: str, detail: dict) -> Dict[str, Any]:
+        """在已有的数据库事务内追加一条审计事件，调用方负责提交/回滚。"""
+        row = conn.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous = row["entry_hash"] if row else "GENESIS"
+        event = make_entry(action, entity_type, entity_id, actor, detail, previous)
+        cur = conn.execute(
+            """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+               previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+             json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+             event["previous_hash"], event["entry_hash"], event["created_at"]),
+        )
+        event["id"] = int(cur.lastrowid)
+        return event
+
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
         with self._lock, self.conn:
-            row = self.conn.execute(
-                "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            previous = row["entry_hash"] if row else "GENESIS"
-            event = make_entry(action, entity_type, entity_id, actor, detail, previous)
-            cur = self.conn.execute(
-                """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
-                   previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (event["action"], event["entity_type"], event["entity_id"], event["actor"],
-                 json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
-                 event["previous_hash"], event["entry_hash"], event["created_at"]),
-            )
-            event_id = int(cur.lastrowid)
-        event["id"] = event_id
+            event = self._append_audit_tx(
+                self.conn, action, entity_type, entity_id, actor, detail)
         return event
+
+    @staticmethod
+    def _review(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["detail"] = json.loads(item["detail"])
+        return item
+
+    def list_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_reviews(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM reviews WHERE item_id=? ORDER BY id DESC", (item_id,)
+            ).fetchall()
+        return [self._review(row) for row in rows]
+
+    def get_review(self, review_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM reviews WHERE id=?", (review_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("复核结论不存在")
+        return self._review(row)
+
+    def _replay_backfill(self, batch_id: str) -> Dict[str, Any]:
+        """幂等重放：批次已存在时返回既有结果，不重复写入。"""
+        batch = self.conn.execute(
+            "SELECT * FROM backfill_batches WHERE batch_id=?", (batch_id,)
+        ).fetchone()
+        item_id = int(batch["item_id"])
+        readings = [dict(row) for row in self.conn.execute(
+            "SELECT * FROM readings WHERE batch_id=? ORDER BY id", (batch_id,)
+        ).fetchall()]
+        review_row = self.conn.execute(
+            "SELECT * FROM reviews WHERE item_id=? ORDER BY id DESC LIMIT 1", (item_id,)
+        ).fetchone()
+        return {
+            "replayed": True,
+            "batch_id": batch_id,
+            "readings": readings,
+            "review": self._review(review_row) if review_row else None,
+            "item": self.get_item(item_id),
+        }
+
+    def backfill_readings(self, item_id: int, expected_version: int, batch_id: str,
+                          readings: List[Dict[str, Any]], actor: str) -> Dict[str, Any]:
+        """按批次补传现场读数。
+
+        整批写入在一个事务内完成：批次登记、读数入库、旧复核失效、新复核重算、
+        审计追加，要么全部成功要么全部回滚。batch_id 已存在时幂等重放；
+        版本乐观锁失败则抛出携带 current_version 的 ConflictError。
+        """
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            existing = self.conn.execute(
+                "SELECT 1 FROM backfill_batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+            if existing:
+                return self._replay_backfill(batch_id)
+            cur = self.conn.execute(
+                "UPDATE items SET version=version+1, updated_at=? WHERE id=? AND version=?",
+                (now, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                current = self.conn.execute(
+                    "SELECT version FROM items WHERE id=?", (item_id,)
+                ).fetchone()
+                raise ConflictError(
+                    "版本冲突，请刷新后重试",
+                    current_version=int(current["version"]) if current else None,
+                )
+            self.conn.execute(
+                "INSERT INTO backfill_batches(batch_id, item_id, actor, created_at) "
+                "VALUES(?,?,?,?)",
+                (batch_id, item_id, actor, now),
+            )
+            for reading in readings:
+                self.conn.execute(
+                    """INSERT INTO readings(item_id, batch_id, kind, value, unit,
+                       observed_at, created_by, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                    (item_id, batch_id, reading["kind"], reading["value"],
+                     reading.get("unit"), reading["observed_at"], actor, now),
+                )
+            stale_rows = self.conn.execute(
+                "SELECT id FROM reviews WHERE item_id=? AND stale=0", (item_id,)
+            ).fetchall()
+            stale_ids = [int(r["id"]) for r in stale_rows]
+            if stale_ids:
+                self.conn.executemany(
+                    "UPDATE reviews SET stale=1 WHERE id=?",
+                    [(review_id,) for review_id in stale_ids],
+                )
+            all_readings = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()]
+            conclusion, detail = recalculate_review(dict(row), all_readings)
+            cur = self.conn.execute(
+                """INSERT INTO reviews(item_id, conclusion, detail, stale, created_by, created_at)
+                   VALUES(?,?,?,0,?,?)""",
+                (item_id, conclusion, json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                 actor, now),
+            )
+            review_id = int(cur.lastrowid)
+            self._append_audit_tx(self.conn, "backfill", ENTITY, item_id, actor, {
+                "batch_id": batch_id,
+                "readings": len(readings),
+                "kinds": sorted({r["kind"] for r in readings}),
+                "stale_review_ids": stale_ids,
+            })
+            self._append_audit_tx(self.conn, "review", ENTITY, item_id, actor, {
+                "review_id": review_id,
+                "conclusion": conclusion,
+                "stale_review_ids": stale_ids,
+                "batch_id": batch_id,
+            })
+        return {
+            "replayed": False,
+            "batch_id": batch_id,
+            "readings": [dict(r) for r in self.conn.execute(
+                "SELECT * FROM readings WHERE batch_id=? ORDER BY id", (batch_id,)
+            ).fetchall()],
+            "review": self.get_review(review_id),
+            "item": self.get_item(item_id),
+        }
+
+    def recalculate_review(self, item_id: int, actor: str) -> Dict[str, Any]:
+        """根据当前全部读数重算复核结论，旧结论标记失效，历史仍可查。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            stale_rows = self.conn.execute(
+                "SELECT id FROM reviews WHERE item_id=? AND stale=0", (item_id,)
+            ).fetchall()
+            stale_ids = [int(r["id"]) for r in stale_rows]
+            if stale_ids:
+                self.conn.executemany(
+                    "UPDATE reviews SET stale=1 WHERE id=?",
+                    [(review_id,) for review_id in stale_ids],
+                )
+            all_readings = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()]
+            conclusion, detail = recalculate_review(dict(row), all_readings)
+            cur = self.conn.execute(
+                """INSERT INTO reviews(item_id, conclusion, detail, stale, created_by, created_at)
+                   VALUES(?,?,?,0,?,?)""",
+                (item_id, conclusion, json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                 actor, now),
+            )
+            review_id = int(cur.lastrowid)
+            self._append_audit_tx(self.conn, "review", ENTITY, item_id, actor, {
+                "review_id": review_id,
+                "conclusion": conclusion,
+                "stale_review_ids": stale_ids,
+                "recalculated": True,
+            })
+        return self.get_review(review_id)
 
     def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"

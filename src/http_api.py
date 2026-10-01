@@ -71,7 +71,10 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            body = {"error": exc.__class__.__name__, "message": str(exc)}
+            if isinstance(exc, ConflictError) and getattr(exc, "extra", None):
+                body.update(exc.extra)
+            self._json(status, body)
 
         def do_GET(self) -> None:
             try:
@@ -89,6 +92,16 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/readings"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"readings": service.list_readings(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/reviews"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"reviews": service.list_reviews(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -119,6 +132,12 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/readings/backfill"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.backfill_readings(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/reviews/recalculate"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.recalculate_review(item_id, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from . import rules
+from .domain import (ValidationError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
 from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
@@ -54,6 +57,59 @@ class Service:
             "record_id": record["id"], "kind": kind, "status": status,
         })
         return record
+
+    def backfill_readings(self, item_id: int, payload: Dict[str, Any], actor: str,
+                          role: str) -> Dict[str, Any]:
+        """断网后按批次补传现场读数，并入已有缺陷。
+
+        读数的现场观测时间早于处置时间也会保留并参与复核重算；同一批次重复提交
+        幂等返回；版本冲突时由仓库抛出携带 current_version 的 ConflictError。
+        """
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        self.repository.get_item(item_id)
+        expected_version = payload.get("expected_version")
+        if not isinstance(expected_version, int) or expected_version < 1:
+            raise ValidationError("expected_version必须是正整数")
+        raw_readings = payload.get("readings")
+        if not isinstance(raw_readings, list) or len(raw_readings) == 0:
+            raise ValidationError("readings必须是非空数组")
+        batch_id = payload.get("batch_id")
+        if batch_id is None or (isinstance(batch_id, str) and not batch_id.strip()):
+            batch_id = f"batch-{uuid.uuid4().hex}"
+        else:
+            batch_id = require_text(batch_id, "batch_id", 100)
+        readings = []
+        for raw in raw_readings:
+            if not isinstance(raw, dict):
+                raise ValidationError("每条读数必须是对象")
+            kind = require_text(raw.get("kind"), "kind", 50)
+            if kind not in rules.READING_KINDS:
+                raise ValidationError("kind必须是seepage或displacement")
+            value = require_number(raw.get("value"), "value")
+            unit = raw.get("unit")
+            if unit is not None:
+                unit = require_text(unit, "unit", 20)
+            observed_at = require_text(raw.get("observed_at"), "observed_at", 40)
+            readings.append({
+                "kind": kind, "value": value, "unit": unit, "observed_at": observed_at,
+            })
+        return self.repository.backfill_readings(
+            item_id, expected_version, batch_id, readings, actor)
+
+    def recalculate_review(self, item_id: int, actor: str, role: str) -> Dict[str, Any]:
+        """读数更新后手动重算复核结论，旧结论失效但历史可查。"""
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        return self.repository.recalculate_review(item_id, actor)
+
+    def list_readings(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_readings(item_id)
+
+    def list_reviews(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_reviews(item_id)
 
     def transition(self, item_id: int, target: str, expected_version: int,
                    actor: str, role: str) -> Dict[str, Any]:
